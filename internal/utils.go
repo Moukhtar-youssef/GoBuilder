@@ -3,66 +3,117 @@ package internal
 import (
 	"encoding/json"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"io/fs"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 )
 
-func ValidateProjectDirectory(dir string) error {
-	info, err := os.Stat(dir)
+func CheckGoInstalled() error {
+	path, err := exec.LookPath("go")
 	if err != nil {
-		return fmt.Errorf("project directory does not exist: %s", dir)
+		return fmt.Errorf(
+			"go toolchain not found in PATH — please install Go from https://go.dev/dl",
+		)
 	}
+	_ = path
+	return nil
+}
 
-	if !info.IsDir() {
-		return fmt.Errorf("project path is not a directory: %s", dir)
-	}
-
-	entries, err := os.ReadDir(dir)
+func IsMainFile(path string) (bool, error) {
+	fset := token.NewFileSet()
+	node, err := parser.ParseFile(fset, path, nil, 0)
 	if err != nil {
-		return fmt.Errorf("cannot read project directory: %v", err)
+		return false, err
 	}
-
-	hasGoFiles := false
-	hasGoMod := false
-
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			if strings.HasSuffix(entry.Name(), ".go") {
-				hasGoFiles = true
-			}
-			if entry.Name() == "go.mod" {
-				hasGoMod = true
+	if node.Name.Name != "main" {
+		return false, nil
+	}
+	for _, decl := range node.Decls {
+		if fn, ok := decl.(*ast.FuncDecl); ok {
+			if fn.Name.Name == "main" && fn.Recv == nil {
+				return true, nil
 			}
 		}
 	}
 
-	if !hasGoFiles {
-		return fmt.Errorf("no Go source files found in directory: %s", dir)
-	}
-
-	if !hasGoMod {
-		fmt.Printf("Warning: no go.mod found in %s - this may not be a proper Go module\n", dir)
-	}
-
-	return nil
+	return false, nil
 }
 
-func GetAvilablePlatforms() ([]GoDist, error) {
+func ValidateProjectDirectory(dir string, spinner *Spinner) (string, error) {
+	info, err := os.Stat(dir)
+	if err != nil {
+		return "", fmt.Errorf("project directory does not exist: %s", dir)
+	}
+
+	if !info.IsDir() {
+		return "", fmt.Errorf("project path is not a directory: %s", dir)
+	}
+
+	var hasGoFiles bool
+	var hasGoMod bool
+	var mainFile string
+	err = filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		name := d.Name()
+		if strings.HasSuffix(name, ".go") {
+			hasGoFiles = true
+			ok, err := IsMainFile(path)
+			if err != nil {
+				return err
+			}
+
+			if ok {
+				mainFile = path
+			}
+		}
+		if name == "go.mod" {
+			hasGoMod = true
+		}
+		return nil
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed walking project directory: %v", err)
+	}
+	if !hasGoFiles {
+		return "", fmt.Errorf("no Go source files found anywhere in directory: %s", dir)
+	}
+	if !hasGoMod {
+		spinner.BufferWarn(
+			fmt.Sprintf("no go.mod found in %s — may not be a proper Go module", dir),
+		)
+	}
+	if mainFile == "" {
+		return "", fmt.Errorf("no valid main() entrypoint found")
+	}
+
+	return mainFile, nil
+}
+
+func GetAvailablePlatforms() ([]GoDist, error) {
 	cmd := exec.Command("go", "tool", "dist", "list", "-json")
 	output, err := cmd.Output()
 	if err != nil {
-		return nil, fmt.Errorf("failed to get avilable platform list: %w", err)
+		return nil, fmt.Errorf("failed to get available platform list: %v", err)
 	}
 
 	var platforms []GoDist
 	if err := json.Unmarshal(output, &platforms); err != nil {
-		return nil, fmt.Errorf("failed to parse avilable platform list: %w", err)
+		return nil, fmt.Errorf("failed to parse available platform list: %v", err)
 	}
 	return platforms, nil
 }
 
-func ParseTargets(targetF string, allPlatforms []GoDist) []GoDist {
+func ParseTargets(targetF string, allPlatforms []GoDist, spinner *Spinner) []GoDist {
 	if targetF == "" {
 		return allPlatforms
 	}
@@ -77,14 +128,19 @@ func ParseTargets(targetF string, allPlatforms []GoDist) []GoDist {
 		if strings.Contains(target, "/") {
 			parts := strings.Split(target, "/")
 			if len(parts) == 2 {
+				found := false
 				targetOS := strings.TrimSpace(parts[0])
 				targetArch := strings.TrimSpace(parts[1])
 
 				for _, platform := range allPlatforms {
 					if platform.GOOS == targetOS && platform.GOARCH == targetArch {
 						selectedPlatforms = append(selectedPlatforms, platform)
+						found = true
 						break
 					}
+				}
+				if !found {
+					spinner.BufferWarn(fmt.Sprintf("unrecognized target %q — skipping", target))
 				}
 			}
 		} else {
@@ -97,4 +153,14 @@ func ParseTargets(targetF string, allPlatforms []GoDist) []GoDist {
 	}
 
 	return selectedPlatforms
+}
+
+func FilterFirstClass(platforms []GoDist) []GoDist {
+	var result []GoDist
+	for _, p := range platforms {
+		if p.FirstClass {
+			result = append(result, p)
+		}
+	}
+	return result
 }

@@ -1,68 +1,137 @@
-/*
-Copyright © 2026 NAME HERE <EMAIL ADDRESS>
-*/
 package cmd
 
 import (
-	"fmt"
-	"log"
 	"os"
 	"path/filepath"
+	"runtime"
 
 	"github.com/Moukhtar-youssef/GoBuilder/internal"
 	"github.com/spf13/cobra"
 )
 
+// go build -ldflags "-X github.com/Moukhtar-youssef/GoBuilder/cmd.version=1.0.0"
+var version = "dev"
+
 var (
-	projectDir string
-	outputDir  string
-	targets    string
-	BinaryName string
+	projectDir       string
+	outputDir        string
+	targets          string
+	binaryName       string
+	specificEntry    string
+	concurrencyLimit int
+	compress         bool
+	firstClassOnly   bool
+	dryRun           bool
 )
 
-// rootCmd represents the base command when called without any subcommands
 var rootCmd = &cobra.Command{
-	Use:   "GoBuilder",
-	Short: "A brief description of your application",
-	Long: `A longer description that spans multiple lines and likely contains
-examples and usage of using your application. For example:
+	Use:     "GoBuilder",
+	Version: version,
+	Short:   "Cross-compile your Go project for every platform in one command",
+	Long: `GoBuilder is a CLI tool that cross-compiles your Go project for multiple
+platforms and architectures in parallel.
 
-Cobra is a CLI library for Go that empowers applications.
-This application is a tool to generate the needed files
-to quickly create a Cobra application.`,
-	// Uncomment the following line if your bare application
-	// has an action associated with it:
+Instead of manually setting GOOS and GOARCH for every target, GoBuilder
+discovers your project's entry point, resolves all available Go toolchain
+targets, and builds them concurrently — then prints a summary of every
+output with its file size.
+
+Examples:
+  # Build for all available platforms
+  GoBuilder -p ./myproject
+
+  # Build for specific targets only
+  GoBuilder -p ./myproject -t linux/amd64,darwin/arm64,windows/amd64
+
+  # Build first-class targets only with a custom binary name
+  GoBuilder -p ./myproject --first-class-only -n mybinary
+
+  # Build and compress output binaries
+  GoBuilder -p ./myproject --compress -o ./releases
+
+  # Preview what would be built without building
+  GoBuilder -p ./myproject -t linux/amd64,darwin/arm64 --dry-run
+
+  # Point at a specific entry file
+  GoBuilder -p ./myproject -e cmd/server/main.go`,
+
 	Run: func(cmd *cobra.Command, args []string) {
+		spinner := internal.NewSpinner("Resolving project path...")
+		spinner.Start()
+
+		err := internal.CheckGoInstalled()
+		if err != nil {
+			spinner.Fail(err.Error())
+			os.Exit(1)
+		}
+
 		absProjectDir, err := filepath.Abs(projectDir)
 		if err != nil {
-			log.Fatal("Error resolving project directory: %w\n", err)
+			spinner.Fail("Could not resolve project path: " + err.Error())
+			os.Exit(1)
 		}
-		fmt.Println("Validating project dir")
-		err = internal.ValidateProjectDirectory(absProjectDir)
+
+		spinner.SetMessage("Validating project directory...")
+		mainFilePath, err := internal.ValidateProjectDirectory(absProjectDir, spinner)
 		if err != nil {
-			log.Fatal("Error: %w\n", err)
+			spinner.Fail("Project validation failed: " + err.Error())
+			os.Exit(1)
 		}
-		if BinaryName == "" {
-			BinaryName = filepath.Base(absProjectDir)
+
+		if binaryName == "" {
+			binaryName = filepath.Base(absProjectDir)
 		}
-		fmt.Println("Grabbing all avilable platforms")
-		platforms, err := internal.GetAvilablePlatforms()
+
+		if specificEntry != "" {
+			spinner.SetMessage("Validating entry file...")
+			if _, err := os.Stat(specificEntry); err != nil {
+				spinner.Fail("Entry file not found: " + specificEntry)
+				os.Exit(1)
+			}
+			ok, err := internal.IsMainFile(specificEntry)
+			if err != nil {
+				spinner.Fail("Error checking entry file: " + err.Error())
+				os.Exit(1)
+			}
+			if !ok {
+				spinner.Fail("Entry file has no func main(): " + specificEntry)
+				os.Exit(1)
+			}
+			mainFilePath = specificEntry
+		}
+
+		spinner.SetMessage("Resolving build targets...")
+		platforms, err := internal.GetAvailablePlatforms()
 		if err != nil {
-			log.Fatal("Error getting all avilable platforms: %w", err)
+			spinner.Fail("Failed to get available platforms: " + err.Error())
+			os.Exit(1)
 		}
-		SelectedTarget := internal.ParseTargets(targets, platforms)
+
+		selectedTargets := internal.ParseTargets(targets, platforms, spinner)
+
+		if firstClassOnly {
+			selectedTargets = internal.FilterFirstClass(selectedTargets)
+		}
+
+		if len(selectedTargets) == 0 {
+			spinner.Fail("No valid targets found — check your -t flag values")
+			os.Exit(1)
+		}
+
 		config := internal.BuildConfig{
-			ProjectDir: absProjectDir,
-			OutputDir:  outputDir,
-			BinaryName: BinaryName,
-			Targets:    SelectedTarget,
+			ProjectDir:  absProjectDir,
+			OutputDir:   outputDir,
+			BinaryName:  binaryName,
+			Targets:     selectedTargets,
+			Compress:    compress,
+			Concurrency: concurrencyLimit,
+			DryRun:      dryRun,
 		}
-		internal.BuildAllPlatforms(config)
+
+		internal.BuildAllPlatforms(config, mainFilePath, spinner)
 	},
 }
 
-// Execute adds all child commands to the root command and sets flags appropriately.
-// This is called by main.main(). It only needs to happen once to the rootCmd.
 func Execute() {
 	err := rootCmd.Execute()
 	if err != nil {
@@ -71,20 +140,22 @@ func Execute() {
 }
 
 func init() {
-	// Here you will define your flags and configuration settings.
-	// Cobra supports persistent flags, which, if defined here,
-	// will be global for your application.
-
-	// rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "", "config file (default is $HOME/.GoBuilder.yaml)")
-
-	// Cobra also supports local flags, which will only run
-	// when this action is called directly.
 	rootCmd.Flags().
-		StringVarP(&projectDir, "project", "p", ".", "Specify the project dir")
+		StringVarP(&projectDir, "project", "p", ".", "Path to the Go project directory")
 	rootCmd.Flags().
-		StringVarP(&outputDir, "output", "o", "./dist", "Specify where the build files are stored")
+		StringVarP(&outputDir, "output", "o", "./dist", "Directory to write build outputs")
 	rootCmd.Flags().
-		StringVarP(&targets, "targets", "t", "", "Specify which target you want to build to if left empty every avilable build profile will run")
+		StringVarP(&targets, "targets", "t", "", "Comma-separated build targets e.g. linux/amd64,darwin/arm64 (default: all platforms)")
 	rootCmd.Flags().
-		StringVarP(&BinaryName, "name", "n", "", "Specify the name of the build file if left empty the name will default to the folder name of the project")
+		StringVarP(&binaryName, "name", "n", "", "Output binary name (default: project directory name)")
+	rootCmd.Flags().
+		StringVarP(&specificEntry, "entry", "e", "", "Path to a specific main.go entry file (default: auto-detected)")
+	rootCmd.Flags().
+		IntVarP(&concurrencyLimit, "concurrency", "c", runtime.NumCPU(), "Max parallel builds (default: number of CPU cores)")
+	rootCmd.Flags().
+		BoolVarP(&compress, "compress", "z", false, "Compress each binary after building (.zip for Windows, .tar.gz for others)")
+	rootCmd.Flags().
+		BoolVar(&firstClassOnly, "first-class-only", false, "Only build for first-class supported Go platforms")
+	rootCmd.Flags().
+		BoolVar(&dryRun, "dry-run", false, "Print targets that would be built without building them")
 }
